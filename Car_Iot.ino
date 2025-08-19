@@ -1,8 +1,7 @@
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
-#include <WiFi.h>
-#include <HTTPClient.h> 
+
 
 // Wi-Fi credentials
 const char* ssid = "iPhone SE 3";
