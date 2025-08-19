@@ -1,270 +1,366 @@
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <Wire.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TFT_eSPI.h>
+#include <ArduinoJson.h>
 
+// ================== SERVO SYSTEM ==================
+const int servoPins[3]  = {18, 19, 21};
+const int sensorPins[3] = {32, 34, 35};
 
-// Wi-Fi credentials
+const int homePos[3]   = {25, 25, 105};
+const int targetPos[3] = {110, 115, 205};
+
+const int triggerThreshold = 500;
+const int stableTime = 100;
+const int holdTime = 5000;
+const int cooldownTime = 1000;
+
+Servo servos[3];
+unsigned long lastBelowThreshold[3] = {0,0,0};
+bool servoTriggered[3] = {false,false,false};
+unsigned long triggerTime[3] = {0,0,0};
+unsigned long cooldownStart[3] = {0,0,0};
+
+// ================== WIFI + TFT DISPLAY ==================
 const char* ssid = "iPhone SE 3";
 const char* password = "senithi1234";
 
-//Backend API endpoint where the ESP32 POSTs sensor data
-const char* serverUrl = "http://172.20.10.4:3001/api/data";
+const char* irUrl = "http://172.20.10.4:3001/api/ir";
+const char* currentUrl = "http://172.20.10.4:3001/api/current";
 
-// LED Pins
-#define RED_LED     33
-#define BLUE_LED    26
-#define GREEN_LED   25
-#define ORANGE_LED  32
+const int irPin = 13;
+bool lastIrState = LOW;
+unsigned long lastUpdateTime = 0;
+unsigned long lastIrTriggerTime = 0;
+int lastDisplayedTime = -1;
+String lastDisplayedName = "";
+bool gameWasFinished = false;
+unsigned long gameOverShownTime = 0;
+bool statsShown = false;
 
-// Ultrasonic Sensor Pins
-#define TRIG_PIN    12   // MTDI (strap) — must be LOW at boot
-#define ECHO_PIN    13
+TFT_eSPI tft = TFT_eSPI();
 
-// Buzzer Pin
-#define BUZZER_PIN  27
+// ================== STEPPER - FIXED ==================
+#define STEP_PIN 12
+#define DIR_PIN  14
+const int stepsFor85Degrees = 47;
+const int stepDelay = 1500;
+const int stepperIrThreshold = 1300;  // Consistent threshold value
+bool stepperTriggered = false;
+bool stepperInMotion = false;
+unsigned long stepperStartTime = 0;
+unsigned long lastTriggerTime = 0;
+const unsigned long preventRetriggerTime = 8000;
 
-unsigned long lastSent = 0;
-const long sendInterval = 200; // 
+// ================== DC MOTOR ==================
+#define IN1 25
+#define IN2 33
+#define ENA 26
+const int pwmChannel = 0;
+const int freq = 1000;
+const int resolution = 8;
+int motorSpeed = 255;
+int onDuration = 500;
+int offDuration = 3000;
+unsigned long lastMotorToggle = 0;
+bool motorOn = false;
+bool motorInitialized = false;
 
-// Thresholds 
-const float movementThreshold = 0.05;//(meters per second squared)
-const float hitThreshold = 1.75;       
-const float accelThreshold = 0.75;
-const int obstacleDistance = 25;
-
-Adafruit_MPU6050 mpu;
-float prevAccel = 0;
-
-// Collision detection with persistence
-bool collisionDetected = false;
-unsigned long collisionStartTime = 0;
-const unsigned long collisionDuration = 300; // Keep collision flag true for 300ms
-bool collisionSent = false; // Track if this collision was already sent
-
-// Acceleration LED latch
-unsigned long accelLEDTimer = 0;
-const unsigned long accelLEDDuration = 500;
-bool accelLEDActive = false;
-
-// WiFi reconnection tracking
-unsigned long lastWiFiCheck = 0;
-const long wifiCheckInterval = 5000; // Check WiFi every 5 seconds
-
-void forceTrigLowAtBoot() {
-  pinMode(TRIG_PIN, INPUT_PULLDOWN);
-  delay(20);
-  pinMode(TRIG_PIN, OUTPUT);
-  digitalWrite(TRIG_PIN, LOW);
-}
-
+// ================== SETUP ==================
 void setup() {
   Serial.begin(115200);
-  forceTrigLowAtBoot();
 
-  // LED setup
-  pinMode(RED_LED, OUTPUT);
-  pinMode(BLUE_LED, OUTPUT);
-  pinMode(GREEN_LED, OUTPUT);
-  pinMode(ORANGE_LED, OUTPUT);
-
-  // Buzzer setup
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-
-  // Ultrasonic setup
-  pinMode(ECHO_PIN, INPUT);
-
-  // MPU setup
-  Wire.begin();//starts I2c Connection
-  if (!mpu.begin()) {
-    Serial.println("MPU6050 not detected!");
-    while (1) delay(10);
+  // Servos
+  for (int i = 0; i < 3; i++) {
+    servos[i].attach(servoPins[i]);
+    servos[i].write(homePos[i]);
   }
 
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);//measure up to ±8 times the force of gravity 
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);//measure rotation upto  to ±500 degrees per second
-  mpu.setFilterBandwidth(MPU6050_BAND_5_HZ);//smooths out noisy signals from the sensor.
-
-  connectWiFi();
-  Serial.println("Setup complete.");
-}
-
-void loop() {
-
-  // Check WiFi connection periodically
-  if (millis() - lastWiFiCheck >= wifiCheckInterval) {
-    lastWiFiCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi disconnected! Reconnecting...");
-      connectWiFi();
-    }
-  }
-
-  // Read sensors
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  float accelX = a.acceleration.x;
-  float accelY = a.acceleration.y;
-  float accelZ = a.acceleration.z;
-
-  // Calculate acceleration magnitude
-  float currentAccel = sqrt(accelX*accelX + accelY*accelY + accelZ*accelZ);//dot prodict vector
-  float accelChange = fabs(currentAccel - prevAccel);//How much did it change since the last moment
-  prevAccel = currentAccel;
-
- 
- //Detecting a new collision
-  if (accelChange > hitThreshold) {
-    if (!collisionDetected) {
-      // New collision detected
-      collisionDetected = true;
-      collisionStartTime = millis();
-      collisionSent = false; // Reset the sent flag for new collision
-      Serial.println("NEW COLLISION DETECTED! AccelChange: " + String(accelChange));
-    }
-  }
-
-  // Clearing the collision after 500ms if it has not 
-  if (collisionDetected && (millis() - collisionStartTime >= collisionDuration)) {
-    collisionDetected = false;
-    Serial.println("Collision flag cleared");
-  }
-
-  int distance = getDistance();
-
-  // Reset LEDs
-  resetLEDs();
-
-  // Respond to the collission 
-  if (collisionDetected) {
-    digitalWrite(RED_LED, HIGH);
-    digitalWrite(BUZZER_PIN, HIGH);
-  } else {
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-
-  // Handle obstacle detection
-  if (distance > 0 && distance < obstacleDistance) {
-    digitalWrite(ORANGE_LED, HIGH);
-  }
-
-  // Handle acceleration detection
-  if (accelChange > accelThreshold) {
-    accelLEDActive = true;
-    accelLEDTimer = millis();
-  }
-
-  // Keep acceleration LED on for duration
-  if (accelLEDActive) {
-    digitalWrite(BLUE_LED, HIGH);
-    if (millis() - accelLEDTimer >= accelLEDDuration) {
-      accelLEDActive = false;
-    }
-  }
-
-  // Handle movement detection
-  if (accelChange > movementThreshold && !accelLEDActive) {
-    digitalWrite(GREEN_LED, HIGH);
-  }
-
-  // Send data with collision priority
-  if (millis() - lastSent >= sendInterval && WiFi.status() == WL_CONNECTED) {
-    lastSent = millis();
-    
-    // Force immediate send if collision detected but not yet sent
-    if (collisionDetected && !collisionSent) {
-      Serial.println("SENDING COLLISION DATA IMMEDIATELY!");
-      collisionSent = true; // Mark as sent to avoid duplicates
-    }
-    
-    sendData(accelX, accelY, accelZ, collisionDetected, distance);
-  }
-  
-  // EMERGENCY: If collision detected but WiFi down, try to reconnect immediately
-  if (collisionDetected && !collisionSent && WiFi.status() != WL_CONNECTED) {
-    Serial.println("COLLISION DETECTED BUT WIFI DOWN - EMERGENCY RECONNECT!");
-    connectWiFi();
-  }
-
-  delay(50);
-}
-
-void resetLEDs() {
-  digitalWrite(RED_LED, LOW);
-  digitalWrite(BLUE_LED, LOW);
-  digitalWrite(GREEN_LED, LOW);
-  digitalWrite(ORANGE_LED, LOW);
-}
-
-int getDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-  int distance = duration * 0.034 / 2;
-
-  if (distance <= 0 || distance > 400) return -1;
-  return distance;
-}
-
-void connectWiFi() {
-  Serial.print("Connecting to WiFi");
+  // TFT + WiFi
+  pinMode(irPin, INPUT_PULLUP);
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(10, 10);
+  tft.println("Connecting to WiFi...");
   WiFi.begin(ssid, password);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
     Serial.print(".");
-    attempts++;
   }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected. IP: " + WiFi.localIP().toString());
+  Serial.println(" Connected!");
+  tft.fillScreen(TFT_BLACK);
+  tft.setCursor(10, 10);
+  tft.println("WiFi Connected.");
+
+  // Stepper - FIXED
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  digitalWrite(STEP_PIN, LOW);
+  digitalWrite(DIR_PIN, LOW);
+  Serial.println("Stepper motor initialized");
+  Serial.printf("Steps for 85 degrees: %d\n", stepsFor85Degrees);
+  Serial.printf("IR threshold for stepper: >%d\n", stepperIrThreshold);
+
+  // DC motor
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  
+  if (!ledcAttach(ENA, freq, resolution)) {
+    Serial.println("Failed to attach LEDC to pin");
   } else {
-    Serial.println("\nWiFi connection failed!");
+    Serial.println("LEDC attached successfully");
+    motorInitialized = true;
+  }
+  
+  ledcWrite(ENA, motorSpeed);
+  motorOn = true;
+  lastMotorToggle = millis();
+  
+  Serial.printf("DC Motor initialized: Speed=%d, On=%dms, Off=%dms\n", 
+                motorSpeed, onDuration, offDuration);
+}
+
+// ================== LOOP ==================
+void loop() {
+  unsigned long now = millis();
+
+  handleServos(now);
+  handleWiFiTFT(now);
+  handleStepper(now);
+  handleDCMotor(now);
+
+  delay(20);
+}
+
+// ================== FUNCTIONS ==================
+void handleServos(unsigned long now) {
+  for (int i = 0; i < 3; i++) {
+    int sensorValue = readAveraged(sensorPins[i], 5);
+    if (!servoTriggered[i]) {
+      if (now - cooldownStart[i] < cooldownTime) continue;
+      if (sensorValue > triggerThreshold) {
+        if (lastBelowThreshold[i] == 0) lastBelowThreshold[i] = now;
+        else if (now - lastBelowThreshold[i] >= stableTime) {
+          servos[i].write(targetPos[i]);
+          servoTriggered[i] = true;
+          triggerTime[i] = now;
+          Serial.printf("Servo %d TRIGGERED\n", i+1);
+        }
+      } else lastBelowThreshold[i] = 0;
+    } else {
+      if (now - triggerTime[i] >= holdTime) {
+        servos[i].write(homePos[i]);
+        servoTriggered[i] = false;
+        cooldownStart[i] = now;
+        lastBelowThreshold[i] = 0;
+        Serial.printf("Servo %d RESET\n", i+1);
+      }
+    }
   }
 }
 
-void sendData(float ax, float ay, float az, bool collision, int distance) {
-  //Check if WiFi is connected
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Cannot send data - WiFi not connected");
-    return;
-  }
-  //prepares for communication with the server
-  HTTPClient http;
-  http.begin(serverUrl);
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(3000); // 3 second timeout to check whether the server answers back
-
-
-  String json = "{";
-  json += "\"accelX\":" + String(ax, 2) + ",";
-  json += "\"accelY\":" + String(ay, 2) + ",";
-  json += "\"accelZ\":" + String(az, 2) + ",";
-  json += "\"collision\":" + String(collision ? "true" : "false") + ",";
-  json += "\"distance\":" + String(distance);
-  json += "}";
-
-  Serial.println("Sending: " + json);
-  
-  //send the json data to the server 
-  int responseCode = http.POST(json);
-  
-  //checks whether the data was sent successfully using the response code
-  if (responseCode > 0) {
-    Serial.println("Response code: " + String(responseCode));
-    if (collision) {
-      Serial.println("✅ COLLISION DATA SENT SUCCESSFULLY!");
-    }
-  } else {
-    Serial.println("❌ HTTP POST failed: " + String(responseCode));
-    if (collision) {
-      Serial.println("❌ FAILED TO SEND COLLISION DATA!");
+void handleWiFiTFT(unsigned long now) {
+  bool currentIrState = digitalRead(irPin);
+  if (lastIrState == LOW && currentIrState == HIGH && WiFi.status() == WL_CONNECTED) {
+    if (now - lastIrTriggerTime >= 10000) {
+      lastIrTriggerTime = now;
+      HTTPClient http;
+      http.begin(irUrl);
+      http.addHeader("Content-Type", "application/json");
+      int code = http.POST("");
+      Serial.print("POST /api/ir -> ");
+      Serial.println(code);
+      http.end();
+    } else {
+      Serial.println("IR trigger ignored (cooldown active)");
     }
   }
+  lastIrState = currentIrState;
+
+  if (now - lastUpdateTime > 300 && WiFi.status() == WL_CONNECTED) {
+    lastUpdateTime = now;
+    HTTPClient http;
+    http.begin(currentUrl);
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+      String payload = http.getString();
+      StaticJsonDocument<512> doc;
+      if (!deserializeJson(doc, payload)) {
+        int seconds = doc["time"] | 0;
+        bool started = doc["started"] | false;
+        bool finished = doc["finished"] | false;
+        int laps = doc["laps"] | 0;
+        int collisions = doc["collisions"] | 0;
+        int score = doc["score"] | 0;
+        const char* name = doc["name"] | "";
+
+        if (!started) {
+          tft.fillScreen(TFT_BLACK);
+          tft.setTextFont(2);
+          tft.setTextColor(TFT_GREEN, TFT_BLACK);
+          tft.setCursor(5, 30);
+          tft.println("Game Starting...");
+          lastDisplayedTime = -1; gameWasFinished = false; statsShown = false;
+        } else if (seconds != lastDisplayedTime || String(name) != lastDisplayedName) {
+          lastDisplayedTime = seconds;
+          lastDisplayedName = String(name);
+          tft.fillScreen(TFT_BLACK);
+
+          tft.setTextFont(2);
+          tft.setTextColor(TFT_CYAN, TFT_BLACK);
+          tft.setCursor(10, 10);
+          tft.print("Player: ");
+          tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+          tft.println(name);
+
+          tft.setTextFont(6);
+          tft.setTextColor(TFT_GREEN, TFT_BLACK);
+          tft.setCursor(10, 60);
+          tft.printf("%d s", seconds);
+        }
+
+        if (finished && !gameWasFinished) {
+          tft.setTextFont(4);
+          tft.setTextColor(TFT_BLUE, TFT_BLACK);
+          tft.setCursor(10, 120);
+          tft.println("Game Over!");
+          gameOverShownTime = millis();
+          gameWasFinished = true; statsShown = false;
+        }
+
+        if (gameWasFinished && !statsShown && millis() - gameOverShownTime > 4000) {
+          tft.fillScreen(TFT_BLACK);
+
+          tft.setTextFont(2);
+          tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+          tft.setCursor(10, 10); tft.print("Player: ");
+          tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.println(name);
+
+          tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+          tft.setCursor(10, 30); tft.print("Time: ");
+          tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.printf("%d s\n", seconds);
+
+          tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+          tft.setCursor(10, 50); tft.print("Laps: ");
+          tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.println(laps);
+
+          tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+          tft.setCursor(10, 70); tft.print("Collisions: ");
+          tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.println(collisions);
+
+          tft.setTextFont(4);
+          tft.setTextColor(TFT_BLUE, TFT_BLACK);
+          tft.setCursor(10, 100); tft.print("Score: ");
+          tft.println(score);
+
+          statsShown = true;
+        }
+      }
+    }
+    http.end();
+  }
+}
+
+// ================== UPDATED STEPPER FUNCTION ==================
+void handleStepper(unsigned long now) {
+  // Handle ongoing stepper motion (return to home after 35 seconds)
+  if (stepperInMotion) {
+    if (now - stepperStartTime >= 35000) { // 35 seconds holding
+      Serial.println("Returning stepper to home position...");
+      digitalWrite(DIR_PIN, LOW);  // RIGHT direction to return home
+      rotateStepper(stepsFor85Degrees + 5);  // Extra 5 steps for full return
+      stepperInMotion = false;
+      stepperTriggered = false;
+      lastTriggerTime = now;
+      Serial.println("Stepper returned to home position");
+      Serial.println("Waiting for next trigger (8 second cooldown)...");
+    }
+    return; // Don't check for new triggers while in motion
+  }
+
+  // Read IR sensor on GPIO 34
+  int irValue = analogRead(34);
+
+  // Print IR value every 2 seconds
+  static unsigned long lastPrint = 0;
+  if (now - lastPrint > 2000) {
+    Serial.printf("IR Value: %d (Trigger threshold: >%d)\n", irValue, stepperIrThreshold);
+    lastPrint = now;
+  }
+
+  bool irTriggered = (irValue > stepperIrThreshold);
+  bool cooldownExpired = (now - lastTriggerTime >= preventRetriggerTime);
+
+  // Stepper pending 10-second delay
+  static bool stepperPending = false;
+  static unsigned long stepperPendingTime = 0;
+
+  if (irTriggered && !stepperTriggered && cooldownExpired && !stepperPending) {
+    stepperPending = true;
+    stepperPendingTime = now;
+    Serial.println("Stepper IR detected on pin 34, waiting 10 seconds...");
+  }
+
+  if (stepperPending && now - stepperPendingTime >= 10000) { // 10-second delay
+    Serial.println("10 seconds passed, moving stepper 85 degrees LEFT...");
+    digitalWrite(DIR_PIN, HIGH); // LEFT rotation
+    rotateStepper(stepsFor85Degrees);
+    stepperTriggered = true;
+    stepperInMotion = true;
+    stepperStartTime = now;
+    stepperPending = false;
+    Serial.println("Stepper moved and holding position...");
+  }
+}
+
+// ================== DC MOTOR ==================
+void handleDCMotor(unsigned long now) {
+  if (!motorInitialized) return;
   
-  http.end();
+  if (now - lastMotorToggle >= (motorOn ? onDuration : offDuration)) {
+    motorOn = !motorOn;
+    lastMotorToggle = now;
+    
+    if (motorOn) {
+      ledcWrite(ENA, motorSpeed);
+      Serial.printf("Motor ON: Speed=%d for %dms\n", motorSpeed, onDuration);
+    } else {
+      ledcWrite(ENA, 0);
+      Serial.printf("Motor OFF for %dms\n", offDuration);
+    }
+  }
+}
+
+int readAveraged(int pin, int samples) {
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return total / samples;
+}
+
+void rotateStepper(int steps) {
+  Serial.printf("Executing %d steps...\n", steps);
+  
+  for (int i = 0; i < steps; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(stepDelay);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(stepDelay);
+    
+    if ((i + 1) % 10 == 0) {
+      Serial.printf("Step %d/%d\n", i + 1, steps);
+    }
+  }
+  
+  Serial.println("Step sequence completed");
 }
